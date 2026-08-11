@@ -1,0 +1,781 @@
+from django.shortcuts import render
+import requests
+from django.urls import reverse
+from django.http import JsonResponse
+from django.conf import settings
+from .models import *
+from django.contrib.auth import get_user_model
+from django.shortcuts import redirect
+from rest_framework.generics import *
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework.permissions import AllowAny,IsAuthenticated
+User = get_user_model()
+from rest_framework.decorators import api_view,permission_classes
+from .serializers import *
+from rest_framework.exceptions import NotFound
+from django.db.models import Count
+from django.db.models.functions import Lower
+from Accounts.models import *
+from Accounts.utils import get_company_user
+from collections import Counter
+from django.http import HttpResponseRedirect,HttpResponse
+from Accounts.permissions import *
+from .consumers import send_alert
+# Create your views here.
+
+
+def Connect(request):
+    return render(request,'connect.html')
+
+
+class FacebookConnectView(APIView):
+    permission_classes = [IsAuthenticated, IsEmployeeAndCanManageAPI]
+
+    def get(self, request):
+        fb_app_id = settings.FB_APP_ID
+        redirect_uri = request.build_absolute_uri(reverse("facebook_callback"))
+        if "ngrok" in redirect_uri and redirect_uri.startswith("http://"):
+            redirect_uri = redirect_uri.replace("http://", "https://")
+        
+        # ✅ Added pages_messaging permission
+        scope = "pages_show_list,pages_manage_metadata,pages_read_engagement,pages_messaging,business_management"
+        # state = 1
+        target_user = get_company_user(request.user)
+        state = target_user.id if target_user else request.user.id
+
+        fb_login_url = (
+            f"https://www.facebook.com/v20.0/dialog/oauth"
+            f"?client_id={fb_app_id}"
+            f"&redirect_uri={redirect_uri}"
+            f"&scope={scope}"
+            f"&state={state},{request.query_params.get('from',"web")}"
+        )
+
+        return Response({"redirect_url": fb_login_url})
+
+
+def subscribe_page_to_webhook(page_id, page_access_token):
+    try:
+        subscribe_url = f"https://graph.facebook.com/v20.0/{page_id}/subscribed_apps"
+        params = {
+            "subscribed_fields": "messages,messaging_postbacks,messaging_optins,message_echoes",
+            "access_token": page_access_token
+        }
+        
+        response = requests.post(subscribe_url, params=params)
+        result = response.json()
+        
+        if result.get('success'):
+            return True
+        else:
+            return False
+            
+    except Exception as e:
+        return False
+
+
+def check_page_subscription(page_id, page_access_token):
+    """
+    Page এর current subscription status check করে
+    """
+    try:
+        check_url = f"https://graph.facebook.com/v20.0/{page_id}/subscribed_apps"
+        params = {"access_token": page_access_token}
+        
+        response = requests.get(check_url, params=params)
+        result = response.json()
+        
+        print(f"📊 Page {page_id} subscription status: {result}")
+        return result
+        
+    except Exception as e:
+        print(f"❌ Error checking subscription: {e}")
+        return None
+
+
+def fetch_all_facebook_pages(long_lived_user_token):
+    """
+    /me/accounts + Business Manager owned pages সব fetch করে
+    deduplicated dict return করে {page_id: page_data}
+    """
+    all_pages = {}
+
+    # ── 1. Direct pages (/me/accounts) with pagination ──
+    url = "https://graph.facebook.com/v20.0/me/accounts"
+    while url:
+        resp = requests.get(url, params={"access_token": long_lived_user_token})
+        data = resp.json()
+        for page in data.get("data", []):
+            all_pages[page["id"]] = page
+        url = data.get("paging", {}).get("next")  # pagination handle
+
+    # ── 2. Business Manager pages ──
+    biz_url = "https://graph.facebook.com/v20.0/me/businesses"
+    biz_resp = requests.get(biz_url, params={"access_token": long_lived_user_token})
+    businesses = biz_resp.json().get("data", [])
+
+    print(f"📦 Found {len(businesses)} businesses")
+
+    for biz in businesses:
+        biz_id = biz["id"]
+
+        # প্রতিটা Business এর owned_pages fetch করো (pagination সহ)
+        owned_url = f"https://graph.facebook.com/v20.0/{biz_id}/owned_pages"
+        while owned_url:
+            owned_resp = requests.get(
+                owned_url,
+                params={
+                    "access_token": long_lived_user_token,
+                    "fields": "id,name,access_token",  # access_token explicitly চাওয়া লাগবে
+                }
+            )
+            owned_data = owned_resp.json()
+
+            if "error" in owned_data:
+                print(f"⚠️ Business {biz_id} pages error: {owned_data['error']}")
+                break
+
+            for page in owned_data.get("data", []):
+                # শুধু নতুন page add করো, /me/accounts এ থাকলে সেটাই রাখো
+                # কারণ /me/accounts এর token টা better (long-lived page token)
+                if page["id"] not in all_pages:
+                    all_pages[page["id"]] = page
+
+            owned_url = owned_data.get("paging", {}).get("next")
+
+    print(f"✅ Total unique pages found: {len(all_pages)}")
+    return all_pages
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def facebook_callback(request):
+    code = request.GET.get("code")
+    error = request.GET.get("error")
+    state_data = request.GET.get("state")
+    state = state_data.split(",")[0]
+    _from = state_data.split(",")[1]
+
+    if error or not code:
+        return HttpResponseRedirect(f"{settings.FRONTEND_URL}/user/integrations")
+
+    # ── Token exchange ──
+    redirect_uri = request.build_absolute_uri(reverse("facebook_callback")).split('?')[0]
+    if "ngrok" in redirect_uri and redirect_uri.startswith("http://"):
+        redirect_uri = redirect_uri.replace("http://", "https://")
+
+    params = {
+        "client_id": settings.FB_APP_ID,
+        "redirect_uri": redirect_uri,
+        "client_secret": settings.FB_APP_SECRET,
+        "code": code,
+    }
+    resp = requests.get("https://graph.facebook.com/v20.0/oauth/access_token", params=params)
+    data = resp.json()
+
+    if "access_token" not in data:
+        return JsonResponse({"error": "Token exchange failed", "details": data})
+
+    # ── Short → Long-lived token ──
+    exchange_resp = requests.get(
+        "https://graph.facebook.com/v20.0/oauth/access_token",
+        params={
+            "grant_type": "fb_exchange_token",
+            "client_id": settings.FB_APP_ID,
+            "client_secret": settings.FB_APP_SECRET,
+            "fb_exchange_token": data["access_token"],
+        }
+    )
+    long_lived_user_token = exchange_resp.json().get("access_token", data["access_token"])
+
+    # ── সব pages fetch করো ──
+    all_pages = fetch_all_facebook_pages(long_lived_user_token)
+
+    if not all_pages:
+        return JsonResponse({"error": "No pages found"})
+
+    try:
+        user = User.objects.get(id=state)
+    except User.DoesNotExist:
+        return JsonResponse({"error": "User not found"})
+
+    # ── Save to DB ──
+    for page_id, page in all_pages.items():
+        page_name = page.get("name", "")
+        page_access_token = page.get("access_token", "")
+
+        if not page_access_token:
+            # Business Manager page এ access_token নাও থাকতে পারে
+            # যদি business_management permission না থাকে
+            print(f"⚠️ No access_token for page {page_name} ({page_id}), skipping")
+            continue
+
+        existing_profile = ChatProfile.objects.filter(
+            profile_id=page_id, platform="facebook"
+        ).first()
+        if existing_profile and existing_profile.user != user:
+            prev_user = existing_profile.user
+            existing_profile.delete()
+            send_alert(
+                prev_user,
+                "Account Disconnected",
+                f"Your Facebook page '{page_name}' was connected by another user.",
+                type="warning"
+            )
+
+        ChatProfile.objects.update_or_create(
+            profile_id=page_id,
+            platform="facebook",
+            defaults={
+                "user": user,
+                "name": page_name,
+                "access_token": page_access_token,
+                "bot_active": False,
+            }
+        )
+
+    send_alert(user, "Your facebook pages are now connected.")
+
+    if _from == "app":
+        return render(request, 'redirect.html')
+    else:
+        return redirect(f"{settings.FRONTEND_URL}/user/chat-profile")
+
+
+class InstagramConnectView(APIView):
+    permission_classes = [IsAuthenticated, IsEmployeeAndCanManageAPI]
+
+    def get(self, request):
+        import urllib.parse
+        from django.conf import settings
+        
+        client_id = getattr(settings, 'IG_APP_ID', '1267330061816814')
+        backend_url = getattr(settings, 'BACKEND_URL', 'https://api.verseai.nl').rstrip('/')
+        path = reverse("unified_webhook", kwargs={"platform": "instagram"})
+        
+        redirect_uri = f"{backend_url}{path}"
+        if not redirect_uri.endswith('/'):
+            redirect_uri += '/'
+        
+        scope = "instagram_business_basic,instagram_business_manage_messages,instagram_business_manage_comments,instagram_business_content_publish,instagram_business_manage_insights"
+        target_user = get_company_user(request.user)
+        state_id = target_user.id if target_user else request.user.id 
+        _from = request.query_params.get('from', "web")
+        state = f"{state_id},{_from}"
+
+        encoded_redirect_uri = urllib.parse.quote(redirect_uri, safe='')
+        encoded_scope = urllib.parse.quote(scope, safe='')
+        encoded_state = urllib.parse.quote(state, safe='')
+
+        instagram_auth_url = (
+            "https://www.instagram.com/oauth/authorize"
+            f"?force_reauth=true"
+            f"&client_id={client_id}"
+            f"&redirect_uri={encoded_redirect_uri}"
+            f"&scope={encoded_scope}"
+            f"&response_type=code"
+            f"&state={encoded_state}"
+        )
+        return Response({"redirect_url": instagram_auth_url})
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def instagram_callback(request):
+    code = request.GET.get("code")
+    error = request.GET.get("error")
+    state_data = request.GET.get("state")
+    
+    if state_data and "," in state_data:
+        state = state_data.split(",")[0]
+        _from = state_data.split(",")[1]
+    else:
+        state = state_data
+        _from = "web"
+
+    if error or not code:
+        return HttpResponseRedirect(f"{settings.FRONTEND_URL}/user/integrations")
+
+    from django.http import JsonResponse
+    backend_url = getattr(settings, 'BACKEND_URL', 'https://api.verseai.nl').rstrip('/')
+    path = reverse("unified_webhook", kwargs={"platform": "instagram"})
+    redirect_uri = f"{backend_url}{path}"
+    if not redirect_uri.endswith('/'):
+        redirect_uri += '/'
+
+    token_url = "https://api.instagram.com/oauth/access_token"
+    app_id = str(getattr(settings, 'IG_APP_ID', '1267330061816814')).strip()
+    app_secret = str(getattr(settings, 'IG_APP_SECRET', 'd3fbba1b0c2247c16144e7c10b7b397d')).strip()
+    
+    payload = {
+        "client_id": app_id,
+        "client_secret": app_secret,
+        "grant_type": "authorization_code",
+        "redirect_uri": redirect_uri,
+        "code": code,
+    }
+    
+    resp = requests.post(token_url, data=payload)
+    data = resp.json()
+    
+    if "access_token" not in data:
+        return JsonResponse({"error": "Instagram token exchange failed", "details": data}, status=400)
+
+    user_access_token = data["access_token"]
+    ig_user_id = data.get("user_id")
+    
+    exchange_url = "https://graph.instagram.com/access_token"
+    exchange_params = {
+        "grant_type": "ig_exchange_token",
+        "client_secret": app_secret,
+        "access_token": user_access_token,
+    }
+    
+    exchange_resp = requests.get(exchange_url, params=exchange_params)
+    exchange_data = exchange_resp.json()
+    long_lived_token = exchange_data.get("access_token", user_access_token)
+
+    # Try to resolve ID safely
+    try:
+        # 1. Fetch basic info (always available)
+        ig_me_url = "https://graph.instagram.com/me"
+        ig_me_params = {"fields": "id,username", "access_token": long_lived_token}
+        ig_me_data = requests.get(ig_me_url, params=ig_me_params).json()
+        
+        final_ig_id = str(ig_me_data.get("id", ig_user_id))
+        profile_name = ig_me_data.get("username", "Instagram Business")
+        print(f"🔍 [Instagram Callback] Basic Data: {ig_me_data}")
+
+        # 2. Optionally try to get ig_id (numeric business ID) without breaking if not available
+        try:
+            ig_id_params = {"fields": "ig_id", "access_token": long_lived_token}
+            ig_id_resp = requests.get(ig_me_url, params=ig_id_params).json()
+            if "ig_id" in ig_id_resp:
+                final_ig_id = str(ig_id_resp["ig_id"])
+                print(f"✨ [Instagram Callback] Found ig_id: {final_ig_id}")
+            elif "error" in ig_id_resp:
+                print(f"ℹ️ [Instagram Callback] ig_id field not supported for this account: {ig_id_resp['error'].get('message')}")
+        except Exception as e:
+             print(f"ℹ️ [Instagram Callback] Skipping ig_id fetch: {e}")
+            
+    except Exception as e:
+        print(f"❌ [Instagram Callback] Error during ID resolution: {e}")
+        final_ig_id = str(ig_user_id)
+        profile_name = "Instagram Business"
+
+    try:
+        user = User.objects.get(id=state)
+    except (User.DoesNotExist, ValueError):
+        return JsonResponse({"error": "Associated dashboard user not found"}, status=404)
+
+    # Check if this account is already connected by another user
+    existing_profile = ChatProfile.objects.filter(profile_id=final_ig_id, platform='instagram').first()
+    if existing_profile and existing_profile.user != user:
+        prev_user = existing_profile.user
+        existing_profile.delete()
+        send_alert(
+            prev_user, 
+            "Account Disconnected", 
+            f"Your Instagram account '{profile_name}' was connected by another user and has been removed from your account.", 
+            type="warning"
+        )
+
+    profile, created = ChatProfile.objects.update_or_create(
+        platform='instagram',
+        user=user,
+        defaults={
+            "profile_id": final_ig_id,
+            "name": profile_name,
+            "access_token": long_lived_token,
+            "bot_active": False,
+        }
+    )
+    print(f"✅ [Instagram] Profile {'created' if created else 'updated'}: {profile_name} ({final_ig_id})")
+    send_alert(user, "Your instagram page is now connected.")
+
+    # 🔗 CRITICAL STEP: Subscribe the account to receive webhook messages
+    # Instagram Login tokens ONLY work with graph.instagram.com (not graph.facebook.com)
+    try:
+        sub_url = "https://graph.instagram.com/v22.0/me/subscribed_apps"
+        sub_res = requests.post(sub_url, params={
+            "subscribed_fields": "messages,messaging_postbacks,messaging_seen",
+            "access_token": long_lived_token
+        }).json()
+        
+        if sub_res.get("success"):
+            print(f"🔔 [Instagram] ✅ Webhook subscription SUCCESS for {profile_name} ({final_ig_id})")
+        else:
+            print(f"⚠️ [Instagram] Subscription response: {sub_res}")
+            # Fallback: Try via Facebook Graph API (for Page-linked accounts)
+            try:
+                page_res = requests.get("https://graph.facebook.com/v22.0/me/accounts",
+                                        params={"access_token": long_lived_token}).json()
+                for page in page_res.get("data", []):
+                    page_sub = requests.post(
+                        f"https://graph.facebook.com/v22.0/{page['id']}/subscribed_apps",
+                        params={"subscribed_fields": "messages,messaging_postbacks,message_echoes",
+                                "access_token": page.get("access_token")}
+                    ).json()
+                    print(f"🔔 [Instagram] FB Page sub for {page['id']}: {page_sub}")
+            except Exception as fb_e:
+                print(f"ℹ️ [Instagram] FB fallback subscription skipped: {fb_e}")
+
+    except Exception as e:
+        print(f"❌ [Instagram] Webhook subscription error: {e}")
+    
+    if _from == "app":
+        return render(request, 'redirect.html')
+    else:
+        return redirect(f"{settings.FRONTEND_URL}/user/chat-profile")
+
+
+class ConnectWhatsappView(APIView):
+    permission_classes = [IsAuthenticated, IsEmployeeAndCanManageAPI]
+    def get(self, request):
+        import urllib.parse
+        target_user = get_company_user(request.user)
+        if not target_user:
+            return Response({"error": "User not found (company user)"}, status=404)
+        
+        try:
+            company = target_user.company
+        except Exception:
+            return Response({"error": "Company not found"}, status=404)
+    
+        state = target_user.id
+        callback_url = request.build_absolute_uri(reverse("whatsapp_callback"))
+        if "ngrok" in callback_url and callback_url.startswith("http://"):
+            callback_url = callback_url.replace("http://", "https://")
+
+        # ✅ Fix 4: URL encode redirect_uri to prevent OAuth flow breakage
+        encoded_redirect_uri = urllib.parse.quote(callback_url, safe='')
+        encoded_state = urllib.parse.quote(f"{state},{request.query_params.get('from', 'web')}", safe='')
+
+        redirect_url = (
+            f"https://www.facebook.com/v19.0/dialog/oauth"
+            f"?client_id={settings.FB_APP_ID}"
+            f"&redirect_uri={encoded_redirect_uri}"
+            f"&state={encoded_state}"
+            f"&response_type=code"
+            f"&config_id={settings.WHATSAPP_CONFIG_ID}"
+        )
+        
+        return Response({"redirect_url": redirect_url})
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def whatsapp_callback(request):
+    code = request.GET.get("code")
+    error = request.GET.get("error")
+    state_data = request.GET.get("state")
+    
+    # Parse state to get user ID and source
+    if state_data and "," in state_data:
+        state = state_data.split(",")[0]
+        _from = state_data.split(",")[1]
+    else:
+        state = state_data
+        _from = "web"
+    
+    print(f"WhatsApp callback: code={code}, error={error}, state={state_data}, from={_from}")
+
+    if error:
+        return HttpResponseRedirect(f"{settings.FRONTEND_URL}/user/integrations")
+
+    if not code:
+        return HttpResponseRedirect(f"{settings.FRONTEND_URL}/user/integrations")
+
+    # Exchange code for access token
+    token_url = "https://graph.facebook.com/v19.0/oauth/access_token"
+    redirect_uri = request.build_absolute_uri(reverse("whatsapp_callback")).split('?')[0]
+    if "ngrok" in redirect_uri and redirect_uri.startswith("http://"):
+        redirect_uri = redirect_uri.replace("http://", "https://")
+    
+    params = {
+        "client_id": settings.FB_APP_ID,
+        "redirect_uri": redirect_uri,
+        "client_secret": settings.FB_APP_SECRET,
+        "code": code,
+    }
+    
+    resp = requests.get(token_url, params=params)
+    data = resp.json()
+    
+    if "access_token" not in data:
+        return JsonResponse({"error": "Token exchange failed", "details": data})
+
+    short_lived_token = data["access_token"]
+
+    # ✅ Fix 2: Exchange short-lived token for long-lived token
+    exchange_url = "https://graph.facebook.com/v19.0/oauth/access_token"
+    exchange_params = {
+        "grant_type": "fb_exchange_token",
+        "client_id": settings.FB_APP_ID,
+        "client_secret": settings.FB_APP_SECRET,
+        "fb_exchange_token": short_lived_token,
+    }
+    exchange_resp = requests.get(exchange_url, params=exchange_params)
+    exchange_data = exchange_resp.json()
+    access_token = exchange_data.get("access_token", short_lived_token)
+    print(f"🔑 [WhatsApp] Long-lived token obtained: {'yes' if access_token != short_lived_token else 'fallback to short-lived'}")
+
+    # Get WhatsApp Business Account details
+    # First, get the WABA ID from the debug token or business accounts
+    debug_url = "https://graph.facebook.com/v19.0/debug_token"
+    debug_params = {
+        "input_token": access_token,
+        "access_token": f"{settings.FB_APP_ID}|{settings.FB_APP_SECRET}"
+    }
+    
+    debug_resp = requests.get(debug_url, params=debug_params)
+    debug_data = debug_resp.json()
+    
+    # Get WABA (WhatsApp Business Account) information
+    # Try to get WABA from the user's business accounts
+    waba_url = "https://graph.facebook.com/v19.0/me"
+    waba_params = {
+        "fields": "id,name",
+        "access_token": access_token
+    }
+    
+    waba_resp = requests.get(waba_url, params=waba_params)
+    waba_data = waba_resp.json()
+    
+    # Get phone number ID and details
+    # The embedded signup flow should provide WABA ID in the token granular scopes
+    # Let's try to get the phone number ID from the accounts endpoint
+    phone_url = "https://graph.facebook.com/v19.0/me/accounts"
+    phone_params = {
+        "access_token": access_token
+    }
+    
+    phone_resp = requests.get(phone_url, params=phone_params)
+    phone_data = phone_resp.json()
+    
+    # For WhatsApp, we need to get the WABA and phone number ID
+    # The token should have granular_scopes that include the WABA ID
+    granular_scopes = debug_data.get("data", {}).get("granular_scopes", [])
+    waba_id = None
+    
+    for scope in granular_scopes:
+        if scope.get("scope") == "whatsapp_business_management":
+            target_ids = scope.get("target_ids", [])
+            if target_ids:
+                waba_id = target_ids[0]
+                break
+    
+    if not waba_id:
+        return JsonResponse({"error": "WhatsApp Business Account ID not found in token"})
+
+    # Get phone numbers associated with this WABA
+    phone_numbers_url = f"https://graph.facebook.com/v19.0/{waba_id}/phone_numbers"
+    phone_numbers_params = {
+        "access_token": access_token
+    }
+    
+    phone_numbers_resp = requests.get(phone_numbers_url, params=phone_numbers_params)
+    phone_numbers_data = phone_numbers_resp.json()
+    
+    if "data" not in phone_numbers_data or not phone_numbers_data["data"]:
+        return JsonResponse({"error": "No phone numbers found for WhatsApp Business Account"})
+
+    try:
+        user = User.objects.get(id=state)
+    except User.DoesNotExist:
+        return JsonResponse({"error": "User not found"})
+
+    # Save the first phone number (or you can modify to save all)
+    saved_profiles = []
+    
+    for phone in phone_numbers_data["data"]:
+        phone_number_id = phone["id"]
+        display_phone_number = phone.get("display_phone_number", "")
+        verified_name = phone.get("verified_name", "")
+        
+        # Check if this phone number is already connected by another user
+        existing_profile = ChatProfile.objects.filter(profile_id=phone_number_id, platform="whatsapp").first()
+        if existing_profile and existing_profile.user != user:
+            prev_user = existing_profile.user
+            existing_profile.delete()
+            send_alert(
+                prev_user, 
+                "Account Disconnected", 
+                f"Your WhatsApp account '{verified_name or display_phone_number}' was connected by another user and has been removed from your account.", 
+                type="warning"
+            )
+
+        # Create or update the WhatsApp ChatProfile
+        whatsapp_profile, created = ChatProfile.objects.update_or_create(
+            platform="whatsapp",
+            user=user,
+            defaults={
+                "profile_id": phone_number_id,
+                "name": verified_name or display_phone_number,
+                "access_token": access_token,
+                "bot_active": False,
+            }
+        )
+        
+        saved_profiles.append({
+            "id": phone_number_id,
+            "name": verified_name or display_phone_number,
+            "display_phone_number": display_phone_number,
+            "created": created
+        })
+        
+        # For now, only save the first phone number
+
+    # 🔗 Subscribe WABA to receive webhook messages (same pattern as Instagram)
+    try:
+        sub_url = f"https://graph.facebook.com/v19.0/{waba_id}/subscribed_apps"
+        sub_res = requests.post(sub_url, params={
+            "access_token": access_token
+        }).json()
+
+        if sub_res.get("success"):
+            print(f"🔔 [WhatsApp] ✅ Webhook subscription SUCCESS for WABA {waba_id}")
+        else:
+            print(f"⚠️ [WhatsApp] Webhook subscription response: {sub_res}")
+    except Exception as e:
+        print(f"❌ [WhatsApp] Webhook subscription error: {e}")
+
+    send_alert(user, "Your WhatsApp account is now connected.")
+
+    if _from == "app":
+        return render(request, 'redirect.html')
+    else:
+        return redirect(f"{settings.FRONTEND_URL}/user/chat-profile")
+    
+
+class ChatProfileView(RetrieveUpdateAPIView):
+    permission_classes = [IsAuthenticated, IsEmployeeAndCanAccessCustomerSupport]
+    serializer_class = ChatProfileSerializers
+
+    def get_object(self):
+        platform = self.request.query_params.get("platform") or self.request.data.get("platform") or "facebook"
+        
+        target_user = get_company_user(self.request.user)
+        if not target_user:
+             raise NotFound("Company user not found.")
+        
+        profile = ChatProfile.objects.filter(user=target_user, platform=platform).first()
+        if not profile:
+             raise NotFound(detail=f"ChatProfile with platform '{platform}' not found.")
+        
+        return profile
+
+
+class ChatProfileListView(ListAPIView):
+    permission_classes = [IsAuthenticated, IsEmployeeAndCanAccessCustomerSupport]
+    serializer_class = ChatProfileSerializers
+
+    def get_queryset(self):
+        platform = self.request.query_params.get("platform") or self.request.data.get("platform") or "facebook"
+        
+        target_user = get_company_user(self.request.user)
+        if not target_user:
+             raise NotFound("Company user not found.")
+        
+        try:
+            return ChatProfile.objects.filter(user=target_user, platform=platform)
+        except ChatProfile.DoesNotExist:
+            raise NotFound(detail=f"ChatProfile with platform '{platform}' not found.")
+
+
+class CommonAskedLeaderboard(APIView):
+    permission_classes = [IsAuthenticated, IsEmployeeAndCanAccessCustomerSupport]
+    def get(self, request):
+        target_user = get_company_user(request.user)
+        company = Company.objects.filter(user=target_user).first()
+
+        if not company:
+            return Response({"error": "Company not found"}, status=404)
+
+        # Get all incoming messages for this user's rooms
+        messages = ChatMessage.objects.filter(
+            room__profile__user=target_user,
+            type='incoming'
+        ).values_list('text', flat=True)
+
+        # Define question starters
+        question_starters = (
+            "what", "why", "how", "when", "where", "who",
+            "can", "could", "would", "should", "is", "are", "do", "does"
+        )
+
+        # Filter messages that are questions
+        questions = []
+        for text in messages:
+            stripped_text = text.strip()
+            if stripped_text.endswith('?'):
+                questions.append(stripped_text)
+            else:
+                # Check if it starts with a question word
+                first_word = stripped_text.split(' ')[0].lower()
+                if first_word in question_starters:
+                    questions.append(stripped_text)
+
+        # Count the occurrences of each question
+        question_counts = Counter(questions)
+
+        # Get top 10 most common questions
+        top_questions = question_counts.most_common(10)
+
+        # Format data as list of dicts
+        data = [{"text": q, "count": c} for q, c in top_questions]
+
+        return Response(data)
+
+
+class GetOldMessage(APIView):
+    permission_classes = [IsAuthenticated, IsEmployeeAndCanAccessCustomerSupport]
+    def get(self, request,room_id,platform):
+        target_user = get_company_user(request.user)
+        if not ChatRoom.objects.filter(id=room_id,profile__user=target_user,profile__platform=platform).exists():
+            return Response({"error": "Room not found"}, status=404)
+            
+
+        try:
+            room = ChatRoom.objects.get(id=room_id,profile__platform=platform)
+            messages = ChatMessage.objects.filter(room=room).order_by('-timestamp')[:50]
+            serializer = ChatMessageSerializer(messages[::-1], many=True)
+            return Response(serializer.data)
+        except ChatRoom.DoesNotExist:
+            return Response({"error": "Room not found"}, status=404)
+
+      
+class GetTestChatOldMessage(APIView):
+    permission_classes = [IsAuthenticated, IsEmployeeAndCanAccessCustomerSupport]
+    def get(self, request):
+        target_user = get_company_user(request.user)
+        if not target_user:
+            return Response({"error": "User not found (company user)"}, status=404)
+
+        try:
+            company = target_user.company
+        except Exception:
+            return Response({"error": "Company not found"}, status=404)
+
+        messages = TestChat.objects.filter(company=company).order_by('-timestamp')[:50]
+        # Reverse to show oldest first in the list if that is desired, or keep as is.
+        # Use [::-1] as in GetOldMessage to likely match frontend expectation (chronological order)
+        serializer = TestChatSerializer(messages[::-1], many=True)
+        return Response(serializer.data)
+
+
+class SubscribeFacebookPageToWebhook(APIView):
+    permission_classes = [IsAuthenticated, IsEmployeeAndCanManageAPI]
+    def post(self,request,*args,**kwargs):
+        profile = ChatProfile.objects.filter(id=request.query_params.get("profile_id")).first()
+        if not profile:
+            return Response({"error": "Profile not found"}, status=404)
+        
+        subscribe = subscribe_page_to_webhook(profile.profile_id, profile.access_token)
+
+        if not subscribe:
+            return Response({"error": "Failed to subscribe page to webhook"}, status=500)
+            
+        ChatProfile.objects.filter(user=profile.user).exclude(id=profile.id).delete()
+        return Response({"success": "Page subscribed to webhook"}, status=200)

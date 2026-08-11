@@ -1,0 +1,542 @@
+# views.py
+import drf_spectacular
+from rest_framework import viewsets, permissions, status , generics, decorators
+from rest_framework.response import Response
+from .utils import *
+from .models import User
+from .serializers import *
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+import requests
+from .permissions import *
+from django.core.files.base import ContentFile
+from django.contrib.auth.hashers import make_password
+from django.utils.text import slugify
+import random
+import string
+import urllib.parse
+from django.shortcuts import redirect
+from django.views.decorators.csrf import csrf_exempt
+from django.utils.decorators import method_decorator
+from drf_spectacular.utils import extend_schema
+# from Ai.tasks import sync_company_knowledge_task
+
+class UserViewSet(viewsets.ModelViewSet):
+    queryset = User.objects.all()
+    serializer_class = UserSerializer
+
+    def get_permissions(self):
+        if self.action == 'create':
+            return [permissions.AllowAny()]
+        return [permissions.IsAuthenticated()]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if self.request.user.role == 'admin':   
+            return queryset
+        return queryset.filter(id=self.request.user.id)
+    
+    @decorators.action(detail=False, methods=['patch'], url_path='me')
+    def update_me(self, request):
+        user = request.user
+        serializer = self.get_serializer(user, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
+class ResetPassword(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        email = request.data.get('email')
+        new_password = request.data.get('new_password')
+
+        if not email or not new_password :
+            return Response(
+                {"error": "Email and new password are required."},
+                status=400
+            )
+        
+        elif request.user.email != email :
+            return Response(
+                {"error": "You can only reset your own password."},
+                status=403)
+        
+        try:
+            user = User.objects.get(email=email)
+            user.set_password(new_password)
+            user.save()
+            return Response({"success": True, "message": "Password reset successfully"}, status=200)
+        except User.DoesNotExist:
+            return Response({"error": "User not found"}, status=404)
+        
+class GetOtp(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        email = request.data.get('email')
+        task = request.data.get('task', '')
+        if not email:
+            return Response(
+                {"error": "Email is required."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        res = send_otp(email, task)
+
+        if res['success']:
+            return Response({"success": True, "message": res['message']}, status=status.HTTP_200_OK)
+        else:
+            return Response({"error": res['message']}, status=status.HTTP_400_BAD_REQUEST)
+
+class LoginView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    @extend_schema(
+        tags=["Authentication"],
+        summary="User login",
+        request=LoginSerializer,
+        responses={200: LoginSerializer}
+    )
+    def post(self, request, *args, **kwargs):
+        serializer = LoginSerializer(data=request.data,context={'request': request})        
+        if serializer.is_valid():
+            return Response(serializer.validated_data, status=status.HTTP_200_OK)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    
+class VerifyOTP(APIView):
+    permission_classes = [permissions.AllowAny]
+    def post(self, request):
+        email = request.data.get('email')
+        otp_code = request.data.get('otp')
+
+        if not email or not otp_code:
+            return Response(
+                {"error": "Email and OTP code are required."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        result = verify_otp(email, otp_code)    
+
+        if result['success']:
+            try:
+                user = User.objects.get(email=email)
+            except User.DoesNotExist:
+                return Response({"error": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+
+            # Generate JWT tokens
+            refresh = RefreshToken.for_user(user)
+            employee = None
+            if user.role == "employee":
+                employee = Employee.objects.filter(email__iexact=user.email).first()
+
+            return Response({
+                "user": UserSerializer(user, context={'request': request}).data,
+                "permissions": employee.roles if employee else None,
+                "refresh": str(refresh),
+                "access": str(refresh.access_token),
+            }, status=status.HTTP_200_OK)
+        else:
+            # 403 for lock, 400 for invalid/expired
+            status_code = status.HTTP_403_FORBIDDEN if "Too many attempts" in result['message'] else status.HTTP_400_BAD_REQUEST
+            return Response({"success": False, "error": result['message']}, status=status_code)
+
+class CompanyDetailUpdateView(generics.RetrieveUpdateAPIView):
+    serializer_class = CompanySerializer
+    permission_classes = [permissions.IsAuthenticated, IsEmployeeAndCanAccessSystemSettings]
+
+    def get_object(self):
+        """
+        Return a single company instance for the logged-in user or their company owner.
+        """
+        target_user = get_company_user(self.request.user)
+        company = Company.objects.filter(user=target_user).first()
+        if not company:
+            from rest_framework.exceptions import NotFound
+            raise NotFound("No company found for this user.")
+        return company
+    
+    def perform_update(self, serializer):
+        tz = get_user_timezone(self.request)
+        print(f"DEBUG: perform_update tz={tz}")
+        if tz:
+            serializer.save(timezone=tz)
+        else:
+            serializer.save()
+
+class ServiceListCreateView(generics.ListCreateAPIView):
+    serializer_class = ServiceSerializer
+    permission_classes = [permissions.IsAuthenticated, IsEmployeeAndCanAccessSystemSettings]
+
+    def get_queryset(self):
+        target_user = get_company_user(self.request.user)
+        return Service.objects.filter(company__user=target_user)
+
+    def perform_create(self, serializer):
+        target_user = get_company_user(self.request.user)
+        company = Company.objects.filter(user=target_user).first()
+        serializer.save(company=company)
+
+class ServiceRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = ServiceSerializer
+    permission_classes = [permissions.IsAuthenticated, IsEmployeeAndCanAccessSystemSettings]
+
+    def get_queryset(self):
+        # Only allow access to services belonging to the user’s company or owner's company
+        target_user = get_company_user(self.request.user)
+        return Service.objects.filter(company__user=target_user)
+
+    def perform_update(self, serializer):
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        instance.delete()
+    
+class AddEmployeeView(APIView):
+    permission_classes = [permissions.IsAuthenticated,IsOwner,IsEmployeeAndCanManageUsers]
+
+    def get(self, request):
+        target_user = get_company_user(request.user)
+        try:
+            company = Company.objects.get(user=target_user)
+        except Company.DoesNotExist:
+            return Response({'error': 'Company not found.'}, status=404)
+        
+        employees = Employee.objects.filter(company=company)
+
+        plan = Subscriptions.objects.filter(company=company).first()
+
+        if not check_plan(company):
+            return Response({'error': 'No valid plan found'}, status=404)
+              
+        employee_data = []
+        for emp in employees:
+            employee_data.append({
+                'id': emp.id,
+                'email': emp.email,
+                'roles': emp.roles,
+                'permissions': emp.get_all_permissions(),
+                'permissions_details': emp.get_permissions_with_details()
+            })
+        
+        return Response({'employees': employee_data}, status=200)
+    
+    def post(self, request):
+        email = request.data.get('email')
+        roles = request.data.get('roles', [])  
+        
+        if not email:
+            return Response({'error': 'Email is required.'}, status=400)
+        
+        # Validate roles
+        if not isinstance(roles, list):
+            return Response({'error': 'Roles must be a list.'}, status=400)
+        
+        invalid_roles = [role for role in roles if role not in VALID_ROLES]
+        if invalid_roles:
+            return Response({
+                'error': f'Invalid roles: {", ".join(invalid_roles)}. Valid roles are: {", ".join(VALID_ROLES)}'
+            }, status=400)
+        
+        if not roles:
+            return Response({'error': 'At least one role is required.'}, status=400)
+        
+        target_user = get_company_user(request.user)
+        try:
+            company = Company.objects.get(user=target_user)
+        except Company.DoesNotExist:
+            return Response({'error': 'Company not found.'}, status=404)
+        
+        # Check Plan and User Limit
+        if not check_plan(company):
+             return Response({'error': 'No valid plan found or subscription expired.'}, status=400)
+
+        plan_subscription = Subscriptions.objects.filter(company=company).first()
+        current_employees_count = Employee.objects.filter(company=company).count()
+        
+        if current_employees_count >= plan_subscription.plan.user_limit:
+            return Response({'error': 'User limit exceeded. Please upgrade your plan to add more employees.'}, status=400)
+
+        if User.objects.filter(email=email).exists():
+            return Response({'error': 'User with this email already exists.'}, status=400)
+        
+        # Create user
+        password = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(8))
+        user = User.objects.create_user(
+            email=email, 
+            password=password,
+            is_active=True,
+            role='employee'
+        )
+        
+        # Create employee with roles
+        employee = Employee.objects.create(company=company, roles=roles,email=user.email)
+        
+        # Send invitation (assuming this function exists)
+        send_employee_invitation(email, password, company.name,roles)
+        
+        return Response(EmployeeSerializer(employee).data,status=status.HTTP_200_OK)
+    
+class GetPermissionsView(APIView):
+    """Get permissions for the authenticated user"""
+    permission_classes = [permissions.IsAuthenticated, IsOwner, IsEmployeeAndCanManageUsers]
+
+    def get(self, request,employee_id):
+        target_user = get_company_user(request.user)
+        employee = Employee.objects.filter(id=employee_id, company__user=target_user).first()
+
+        if not employee:
+            return Response({"detail": "Employee not found."}, status=404)
+
+        # roles is a JSONField (list of strings)
+        user_roles = getattr(employee, 'roles', [])
+        if not isinstance(user_roles, list):
+            user_roles = [user_roles]
+
+        if not user_roles:
+            return Response({"detail": "User has no assigned roles."}, status=404)
+
+        combined_permissions = {}
+
+        # Merge permissions for all roles
+        for role in user_roles:
+            role_perms = PERMISSIONS_MATRIX.get(role, {})
+            for perm, has_access in role_perms.items():
+                # If any role grants access, mark it as True
+                if perm not in combined_permissions:
+                    combined_permissions[perm] = has_access
+                else:
+                    combined_permissions[perm] = combined_permissions[perm] or has_access
+
+        # Map internal names to readable ones
+        formatted_permissions = {
+            PERMISSION_NAMES.get(perm, perm): access
+            for perm, access in combined_permissions.items()
+        }
+
+        return Response({
+            'id': employee.id,
+            "company": employee.company.user.email,
+            'employee_email': employee.email,
+            "roles": user_roles,
+            "permissions": formatted_permissions
+        })
+
+class UpdatePermissionsView(APIView):
+    """Update roles (permissions) for an employee - Admin only"""
+    permission_classes = [permissions.IsAuthenticated, IsOwner, IsEmployeeAndCanManageUsers]
+
+    def post(self, request,employee_id):
+        target_user = get_company_user(request.user)
+        # Extract target employee email and new roles
+        employee = Employee.objects.filter(id=employee_id, company__user=target_user).first()
+        new_roles = request.data.get("roles")
+        print(new_roles,employee)
+
+        if not employee or not new_roles:
+            return Response(
+                {"detail": "Employee or roles missing."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if not isinstance(new_roles, list):
+            return Response(
+                {"detail": "roles must be a list of role names."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Update roles (assuming roles is a JSONField)
+        employee.roles = new_roles
+        employee.save()
+
+        return Response(EmployeeSerializer(employee).data,status=status.HTTP_200_OK)
+
+    def delete(self, request,employee_id):
+        target_user = get_company_user(request.user)
+        employee = Employee.objects.filter(id=employee_id, company__user=target_user).first()
+        if not employee:
+            return Response({"detail": "Employee not found."}, status=404)
+        employee.delete()
+        return Response({"detail": "Employee deleted successfully."}, status=status.HTTP_200_OK)
+
+class SocialAuthCallbackView(APIView):
+    permission_classes = [permissions.AllowAny]
+    def post(self, request):
+        access_token = request.data.get('access_token')
+        
+        if not access_token:
+            return Response({'error': 'No access token provided'}, status=400)
+        print(access_token)
+        
+        try:
+            # Verify token
+            token_info_response = requests.get(
+                f'https://www.googleapis.com/oauth2/v1/tokeninfo?access_token={access_token}'
+            )
+
+            if token_info_response.status_code != 200:
+                return Response({'error': 'Invalid access token'}, status=400)
+
+            token_info = token_info_response.json()
+
+            if 'error' in token_info:
+                return Response({'error': token_info['error']}, status=400)
+
+            # Get basic user info
+            user_info_response = requests.get(
+                'https://www.googleapis.com/oauth2/v2/userinfo',
+                headers={'Authorization': f'Bearer {access_token}'}
+            )
+
+            user_data = user_info_response.json()
+            profile_image_url = user_data.get("picture")
+            email = user_data.get("email")
+            name = user_data.get("name")
+
+            people_api_url = "https://people.googleapis.com/v1/people/me?personFields=birthdays,phoneNumbers"
+            people_response = requests.get(
+                people_api_url,
+                headers={'Authorization': f'Bearer {access_token}'}
+            )
+
+            
+            try:
+                people_json = people_response.json()
+            except Exception as json_err:
+                people_json = {}
+
+            # Create or get user
+            user, created = User.objects.get_or_create(
+                email=email,
+                defaults={
+                    'name': name,
+                    'is_active': True,
+                    'password': make_password(None)
+                }
+            )
+
+            # Save profile image if new user
+            if created and profile_image_url:
+                img_response = requests.get(profile_image_url)
+                if img_response.status_code == 200:
+                    file_name = f"{slugify(name)}-profile.jpg"
+                    user.image.save(file_name, ContentFile(img_response.content), save=True)
+
+            # Check suspend flag
+            if getattr(user, 'block', False):
+                return Response(
+                    {"error": "User account is disabled. Please contact support"},
+                    status=403
+                )
+
+            # Generate JWT tokens
+            refresh = RefreshToken.for_user(user)
+            serializer = UserSerializer(user, context={'request': request})
+            access = refresh.access_token
+            refresh = refresh
+            plan = Subscriptions.objects.filter(company=get_company(user)).first()
+            session = generate_session(request, user, access)   
+            employee = Employee.objects.filter(email__iexact=user.email).first()
+            return Response({"user": serializer.data, "access": str(access), "refresh": str(refresh), "plan": True if plan else False, "session_id": session.id,"permissions": employee.roles if employee else None})
+
+        except Exception as e:
+            # print full error
+            import traceback
+            print(traceback.format_exc())
+            return Response({'error': str(e)}, status=500)
+
+@method_decorator(csrf_exempt, name='dispatch')
+class AppleLoginView(APIView):
+    permission_classes = [permissions.AllowAny]
+    def post(self, request):
+        # Handle both JSON (mobile) and Form Data (Apple Redirect)
+        identity_token = request.data.get('identity_token') or request.data.get('id_token')
+        # Apple sometimes sends user info (name) for the first time
+        user_info_raw = request.data.get('user', {}) 
+        
+        import json
+        user_info = {}
+        if user_info_raw:
+            try:
+                user_info = json.loads(user_info_raw) if isinstance(user_info_raw, str) else user_info_raw
+            except:
+                pass
+
+        if not identity_token:
+            return Response({'error': 'No identity token provided'}, status=400)
+            
+        decoded_token = verify_apple_id_token(identity_token)
+        if not decoded_token:
+            return Response({'error': 'Invalid identity token'}, status=400)
+            
+        email = decoded_token.get('email')
+        apple_sub = decoded_token.get('sub')  # Apple unique user ID (always present)
+
+        # ✅ "Hide My Email" users এর জন্য sub দিয়ে fallback
+        # Apple Private Relay email বা sub-based synthetic email ব্যবহার করো
+        if not email:
+            if not apple_sub:
+                return Response({'error': 'Unable to identify Apple user'}, status=400)
+            # sub দিয়ে existing user খোঁজো অথবা synthetic email বানাও
+            email = f"apple_{apple_sub}@privaterelay.appleid.com"
+            
+        # Try to get name from user_info if provided (first time login)
+        name = user_info.get('name', {}).get('firstName', '')
+        last_name = user_info.get('name', {}).get('lastName', '')
+        full_name = f"{name} {last_name}".strip() if name or last_name else email.split('@')[0]
+
+        user, created = User.objects.get_or_create(
+            email=email,
+            defaults={
+                'name': full_name,
+                'is_active': True,
+                'password': make_password(None)
+            }
+        )
+
+        if getattr(user, 'block', False):
+            return Response(
+                {"error": "User account is disabled. Please contact support"},
+                status=403
+            )
+
+        # Generate JWT tokens
+        refresh = RefreshToken.for_user(user)
+        access = str(refresh.access_token)
+        refresh_token = str(refresh)
+        
+        plan = Subscriptions.objects.filter(company=get_company(user)).first()
+        session = generate_session(request, user, refresh.access_token)   
+        
+        # Check if it's a browser/redirect flow (Form Data from Apple)
+        if request.content_type == 'application/x-www-form-urlencoded':
+            frontend_url = getattr(settings, 'FRONTEND_URL', 'https://wahejan.vercel.app').rstrip('/')
+            callback_url = f"{frontend_url}/auth/callback"
+            
+            params = urllib.parse.urlencode({
+                'access': access,
+                'refresh': refresh_token,
+                'status': 'success',
+                'session_id': session.id
+            })
+            return redirect(f"{callback_url}?{params}")
+
+        # Standard JSON response for mobile/direct API
+        serializer = UserSerializer(user, context={'request': request})
+        employee = Employee.objects.filter(email__iexact=user.email).first()
+        return Response({
+            "user": serializer.data, 
+            "access": access, 
+            "refresh": refresh_token, 
+            "plan": True if plan else False, 
+            "session_id": session.id,
+            "permissions": employee.roles if employee else None
+        })
+
+
+class UserDataView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def get(self, request):
+        return Response(UserSerializer(request.user, context={'request': request}).data)
