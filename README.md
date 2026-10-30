@@ -7,9 +7,101 @@
 ![Qdrant](https://img.shields.io/badge/Qdrant-Vector%20DB-DC2626.svg?style=for-the-badge)
 ![Docker](https://img.shields.io/badge/Docker-Enabled-2496ED.svg?style=for-the-badge&logo=docker&logoColor=white)
 
-An enterprise-grade omnichannel customer engagement, business operations, and automated AI assistance platform. Centralizes communications across **Facebook Messenger**, **Instagram DM**, and **WhatsApp** with retrieval-augmented generation (RAG), Stripe marketplace billing, appointment scheduling, and automated ticketing.
+An AI agent platform that answers customers on **WhatsApp, Instagram and Facebook Messenger**, using each business's own documents as its knowledge base. The agent can check availability, **book appointments**, and **send Stripe payment links** inside the chat. Businesses (tenants) manage everything from a dashboard API, and human agents can take over a conversation live.
+
+## 🚀 Key Modules & Capabilities
+
+### 1. 🤖 AI & RAG Engine (`Ai/`)
+* **Vector Search with Qdrant**: Real-time semantic document retrieval providing context-aware responses without hallucination.
+* **Knowledge Ingestion**: Upload business PDFs, catalogs, or policy documents via `/api/ai-training-files/` to automatically chunk, embed, and synchronize with Qdrant.
+* **Analytics**: Question leaderboard identifying the most frequent customer inquiries for business intelligence.
+
+### 2. 💬 Omnichannel Messaging (`Socials/`)
+* **Unified Webhook Router**: `/webhook/{platform}/` normalizes inbound payloads from Meta platforms (Facebook, Instagram, WhatsApp).
+* **Real-Time WebSockets**: Powered by Django Channels and Redis for instant back-office agent-to-customer live chat.
+* **Customer Profile Tracking**: Automatically captures customer metadata, past interactions, and channel identities.
+
+### 3. 💳 Financial Suite (`Finance/`)
+* **Stripe Subscriptions**: Tiered subscription plans with automated checkout sessions and recurring lifecycle handling.
+* **Stripe Connect**: Marketplace onboarding allowing tenant companies to accept customer payments directly.
+* **Webhook Listeners**: Cryptographically verified Stripe event processing for renewals, invoices, and charge failures.
+
+### 4. 🏢 Company Operations & Scheduling (`Accounts/`, `Others/`)
+* **Google Calendar Synchronization**: Sync client bookings and working hours directly with Google Calendar via OAuth2.
+* **Role-Based Access Control (RBAC)**: Manage employee roles, departmental permissions, and audit logs.
+* **Support Ticket Desk**: Lifecycle management for customer support tickets from creation to resolution.
 
 ---
+
+## What the agent does
+
+- **Answers from the business's own data (RAG).** Answers are grounded in the company's knowledge base entries, uploaded PDF/DOCX files, services, opening hours and profile, retrieved from Qdrant.
+- **Qualifies and books.** It collects the service, date/time and customer email, checks real availability, and creates the booking. It refuses to book in the past or with missing details.
+- **Takes payment.** After a booking (or on request) it generates a Stripe Checkout link for the service and sends it in the chat.
+- **Replies in the customer's language.** It detects the language of the incoming message and answers in it, in the tone the business configured.
+- **Hands off to humans.** Staff see conversations in real time over WebSockets and can switch the bot off per chat room or per channel.
+
+## How a message flows
+
+```mermaid
+sequenceDiagram
+    participant C as Customer (WhatsApp / IG / FB)
+    participant W as Webhook (Django)
+    participant Q as Celery + Redis
+    participant A as AI service
+    participant V as Qdrant
+    participant L as OpenAI
+    participant D as Dashboard (WebSocket)
+
+    C->>W: Inbound message (Meta webhook)
+    W->>W: Resolve channel profile, check token quota
+    W->>D: Broadcast message to live dashboard
+    W->>Q: Queue wait_and_reply(room)
+    Q->>A: Build reply from chat history
+    A->>V: Retrieve company-scoped context
+    A->>L: Prompt + context + history
+    L-->>A: Reply or structured action (book / pay)
+    A->>A: Execute action (availability, booking, Stripe link)
+    A-->>C: Send reply via Graph API
+    A->>A: Deduct actual tokens used
+```
+
+Messages that arrive in quick succession are batched by the Celery task so the agent replies once to the whole burst instead of once per message.
+
+## AI design
+
+| Concern | Approach |
+|---|---|
+| Models | OpenAI `gpt-4o` for chat replies, `text-embedding-3-small` for embeddings, `gpt-4o-mini` for analytics |
+| Retrieval | Qdrant vector search, every document tagged with `company_id` and filtered on it so tenants never see each other's data |
+| Chunking | 700-character chunks with 150 overlap (LangChain text splitters) |
+| Ingestion | Knowledge base entries, uploaded PDF/DOCX files, services, opening hours and company profile are re-synced to Qdrant on demand |
+| Actions | The model returns structured JSON (`create_booking`, payment link), and the backend validates fields before executing anything |
+| Availability | Computed from opening hours, existing bookings, service duration, company time zone and a per-company concurrent-booking limit |
+| Prompts | Versioned in the repo (`Ai/last_working_prompt.md`, `Ai/prompt_archive.txt`) |
+
+### Cost control
+
+Running an LLM per message costs money, so usage is metered per tenant:
+
+- A **quota check** runs on every inbound message, before any model call.
+- **Actual input and output tokens** from each completion are deducted from the company's subscription balance.
+- When a balance runs out, the company's bots are **automatically deactivated** and a real-time alert is pushed to their dashboard, so a runaway conversation can't create an unbounded bill.
+- Chat history sent to the model is capped to the last 20 messages.
+
+## Features beyond the agent
+
+- **Billing:** Stripe subscription plans with tiered token allowances, Checkout sessions, and signature-verified Stripe webhooks. Stripe Connect lets each tenant accept payments for its own services.
+- **Scheduling:** Bookings, opening hours, Google Calendar sync (OAuth2), and reminder tasks by email/SMS.
+- **Support desk:** Ticket lifecycle for customer support.
+- **Auth and roles:** Email OTP, JWT, Google and Apple sign-in, employee accounts with granular permissions, and session tracking.
+- **Analytics:** Dashboard metrics and a "most asked questions" leaderboard.
+- **Platform admin:** A separate admin API for approving channels, plan requests and tenant management.
+- **Audit:** Model change history via `django-simple-history` and a user activity log.
+
+## Tech stack
+
+Python 3.12 · Django 5.2 · Django REST Framework · Django Channels (ASGI) · Celery + Celery Beat · Redis · PostgreSQL · Qdrant · LangChain · OpenAI API · Stripe · Meta Graph API (WhatsApp Business, Instagram, Messenger) · Google Calendar API · AWS S3 · Docker Compose · Gunicorn + Uvicorn · Nginx · drf-spectacular (OpenAPI)
 
 ## ⚡ Architecture & Subsystems
 
@@ -37,115 +129,74 @@ An enterprise-grade omnichannel customer engagement, business operations, and au
 
 ---
 
-## 🚀 Key Modules & Capabilities
+## Project layout
 
-### 1. 🤖 AI & RAG Engine (`Ai/`)
-* **Vector Search with Qdrant**: Real-time semantic document retrieval providing context-aware responses without hallucination.
-* **Knowledge Ingestion**: Upload business PDFs, catalogs, or policy documents via `/api/ai-training-files/` to automatically chunk, embed, and synchronize with Qdrant.
-* **Analytics**: Question leaderboard identifying the most frequent customer inquiries for business intelligence.
+```
+Verseai/          Project config: settings, ASGI, Celery, root URLs
+Socials/          Channel profiles, rooms, messages, webhooks, WebSocket consumers
+Ai/               RAG ingestion, AI service (retrieval, prompts, actions), analytics
+Others/           Bookings, calendar sync, knowledge base, tickets, Celery tasks
+Finance/          Plans, subscriptions, payments, Stripe checkout and webhooks
+Accounts/         Users, companies, employees, OTP, RBAC permissions
+admin_dashboard/  Platform-level admin API
+templates/        Email templates and OAuth redirect pages
+```
 
-### 2. 💬 Omnichannel Messaging (`Socials/`)
-* **Unified Webhook Router**: `/webhook/{platform}/` normalizes inbound payloads from Meta platforms (Facebook, Instagram, WhatsApp).
-* **Real-Time WebSockets**: Powered by Django Channels and Redis for instant back-office agent-to-customer live chat.
-* **Customer Profile Tracking**: Automatically captures customer metadata, past interactions, and channel identities.
+## API overview
 
-### 3. 💳 Financial Suite (`Finance/`)
-* **Stripe Subscriptions**: Tiered subscription plans with automated checkout sessions and recurring lifecycle handling.
-* **Stripe Connect**: Marketplace onboarding allowing tenant companies to accept customer payments directly.
-* **Webhook Listeners**: Cryptographically verified Stripe event processing for renewals, invoices, and charge failures.
+Interactive docs are served at `/api/docs/` (Swagger) and `/api/docs/redoc/` once the app is running.
 
-### 4. 🏢 Company Operations & Scheduling (`Accounts/`, `Others/`)
-* **Google Calendar Synchronization**: Sync client bookings and working hours directly with Google Calendar via OAuth2.
-* **Role-Based Access Control (RBAC)**: Manage employee roles, departmental permissions, and audit logs.
-* **Support Ticket Desk**: Lifecycle management for customer support tickets from creation to resolution.
+| Area | Base path | Examples |
+|---|---|---|
+| Auth | `/api/auth/` | login, OTP, Google/Apple login, sessions |
+| Chat | `/api/chat/` | chat profiles, message history, question leaderboard |
+| Finance | `/api/finance/` | plans, checkout, subscriptions, Stripe Connect onboarding |
+| Operations | `/api/` | bookings, opening hours, knowledge base, AI training files, tickets, calendar |
+| Admin | `/api/admin/` | dashboard, users, companies, channel approval |
+| Webhooks | `/api/webhook/<platform>/` | Meta ingress for `whatsapp`, `facebook`, `instagram` |
+| WebSockets | `/ws/chat/`, `/ws/alerts/`, `/ws/testchat/` | live inbox, alerts, in-dashboard bot testing |
 
----
+## Running it locally
 
-## 🔌 API Endpoints Quick Reference
+**Prerequisites:** Docker and Docker Compose, an OpenAI API key, and a Qdrant instance (a free Qdrant Cloud cluster, or `docker run -p 6333:6333 qdrant/qdrant`).
 
-| Domain | Base Path | Key Endpoints | Description |
-|---|---|---|---|
-| **Authentication** | `/api/auth/` | `login/`, `get-otp/`, `verify-otp/`, `google/login/`, `sessions/` | OTP auth, Social login, active session controls |
-| **Messaging** | `/api/chat/` | `chat-profile-list/`, `question-leaderboard/`, `old-message/` | Chat history, customer profiles, AI analytics |
-| **Finance** | `/api/finance/` | `plans/`, `create-checkout/`, `create-subscriptions/`, `connect/onboard/` | Stripe checkout, subscription tiers, Stripe Connect |
-| **Operations** | `/api/` | `tickets/`, `knowledge-base/`, `booking/`, `google/calendar/connect/` | Bookings, ticketing, calendar integration |
-| **Admin Console** | `/api/admin/` | `dashboard/`, `users/`, `companies/`, `approve-channel/` | Tenant approvals, plan requests, platform metrics |
-| **Webhooks** | `/` | `webhook/{platform}/`, `{platform}/callback/`, `payments/stripe-webhook/` | External provider ingress points |
+```bash
+# 1. Configure environment
+cp .env.example .env
+# fill in at least: SECRET_KEY, DB_*, OPENAI_API_KEY, QDRANT_URL
 
----
+# 2. Start the stack (database, Redis, web, Celery worker, Celery beat)
+docker compose up --build db redis web celery_worker celery_beat
 
-## 🛠️ Technology Stack
+# 3. Create tables and an admin user
+docker compose exec web python manage.py migrate
+docker compose exec web python manage.py createsuperuser
+```
 
-* **Core Framework**: Django 5.2, Django REST Framework
-* **Real-Time Layer**: Django Channels, ASGI, Redis 7.0
-* **Async Workers**: Celery 5.5, Celery Beat
-* **AI & NLP**: LangChain, OpenAI API, Qdrant Vector Database
-* **Database**: PostgreSQL (production) / SQLite3 (dev)
-* **API Documentation**: Drf-Spectacular (OpenAPI 3.0 schema)
-* **Containerization**: Docker & Docker Compose
+Notes:
 
----
+- The `web` service is only exposed to Nginx. To reach it directly during development, add `ports: ["8080:8080"]` to that service in `docker-compose.yml`.
+- The full compose file also includes an Nginx container configured for HTTPS with Let's Encrypt certificates (`default.conf`), which is how it ran in production.
+- Meta webhooks need a public HTTPS URL. For local testing, tunnel with a tool such as ngrok and register `https://<tunnel>/api/webhook/<platform>/` in the Meta developer console.
+- Connecting WhatsApp, Instagram or Facebook requires your own Meta app credentials and an approved business account.
 
-## ⚙️ Installation & Deployment
+## Configuration
 
-### Option A: Running with Docker Compose (Recommended)
+Environment variables read by `Verseai/settings.py` and the AI layer:
 
-1. **Clone the repository and enter directory**:
-   ```bash
-   cd Multi-Channel-AI-Business-Chat-Automation-Platform
-   ```
-
-2. **Configure environment variables**:
-   ```bash
-   cp .env.example .env
-   # Fill in DB credentials, OpenAI keys, Stripe secrets, and Meta App IDs
-   ```
-
-3. **Launch all containers**:
-   ```bash
-   docker-compose up --build -d
-   ```
-   *This starts: Django Web container, Celery Worker, Celery Beat Scheduler, and Redis.*
-
-4. **Verify container health**:
-   ```bash
-   docker-compose ps
-   ```
-
-### Option B: Local Python Development Setup
-
-1. **Create and activate a virtual environment**:
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: .\venv\Scripts\activate
-   pip install -r requirements.txt
-   ```
-
-2. **Run Redis**:
-   Ensure Redis is running locally on port `6379`.
-
-3. **Apply migrations and start the server**:
-   ```bash
-   python manage.py migrate
-   python manage.py runserver
-   ```
-
-4. **Run Celery worker in a separate terminal**:
-   ```bash
-   celery -A Verseai worker -l info
-   ```
-
----
-
-## 🛡️ Critical Environment Variables
-
-| Variable | Description |
+| Variable | Purpose |
 |---|---|
-| `SECRET_KEY` | Django cryptographic signing key |
-| `OPENAI_API_KEY` | OpenAI API key for embeddings and completions |
-| `QDRANT_HOST` / `QDRANT_PORT` | Qdrant vector database connection endpoint |
-| `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET` | Stripe API credentials |
-| `FB_APP_ID` / `FB_APP_SECRET` | Meta Developer Platform credentials |
-| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Google Calendar and OAuth credentials |
-| `CELERY_BROKER_URL` | Redis broker URL (e.g., `redis://localhost:6379/0`) |
+| `SECRET_KEY` | Django signing key |
+| `ALLOWED_HOSTS`, `CSRF_TRUSTED_ORIGINS`, `CORS_ALLOWED_ORIGINS` | Host and origin allow-lists (comma-separated) |
+| `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_HOST`, `DB_PORT` | PostgreSQL connection |
+| `REDIS_URL` | Django cache (the Celery broker and channel layer use the `redis` host in Compose) |
+| `OPENAI_API_KEY` | Chat and embeddings |
+| `QDRANT_URL`, `QDRANT_API_KEY` | Vector database |
+| `STRIPE_SECRET_KEY`, `STRIPE_PUBLISHABLE_KEY`, `STRIPE_WEBHOOK_SECRET` | Stripe billing and webhook verification |
+| `FB_APP_ID`, `FB_APP_SECRET`, `IG_APP_ID`, `IG_APP_SECRET`, `WHATSAPP_CONFIG_ID` | Meta apps |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `APPLE_CLIENT_ID` | Sign-in and Google Calendar |
+| `FIELD_ENCRYPTION_KEY` | Encryption of stored channel tokens |
+| `EMAIL_HOST_USER`, `EMAIL_HOST_PASSWORD`, `DEFAULT_FROM_EMAIL`, `CONTACT_EMAIL` | Outgoing email (OTP, invitations, reminders) |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_STORAGE_BUCKET_NAME`, `AWS_S3_REGION_NAME` | S3 media storage |
+| `FRONTEND_URL`, `BACKEND_URL` | Redirect targets for payments and OAuth |
 
